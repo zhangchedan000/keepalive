@@ -7,10 +7,10 @@ System Metrics Collector
 import os, time, random, gzip, hashlib, urllib.request, tempfile, multiprocessing
 
 # ===== 可调参数（想改占用改这里）=====
-CPU_MIN = 0.30          # CPU 占用下限（每核 30%）
+CPU_MIN = 0.20          # CPU 占用下限（每核 20%）
 CPU_MAX = 0.40          # CPU 占用上限（每核 40%）
-MEM_MIN_PCT = 0.40      # 内存占用下限（总内存的 40%）
-MEM_MAX_PCT = 0.50      # 内存占用上限（总内存的 50%）
+MEM_MIN_PCT = 0.30      # 内存占用下限（总内存的 30%）
+MEM_MAX_PCT = 0.45      # 内存占用上限（总内存的 45%）
 # =====================================
 
 URLS = [
