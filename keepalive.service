@@ -8,8 +8,8 @@ Type=simple
 ExecStart=/bin/bash -c 'exec -a python3-worker /usr/bin/python3 /root/keepalive.py'
 Restart=always
 RestartSec=15
-CPUQuota=300%
-MemoryMax=4G
+CPUQuota=400%
+MemoryMax=14G
 Nice=10
 
 [Install]
