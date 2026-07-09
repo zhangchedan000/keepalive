@@ -88,14 +88,11 @@ def big_url(nbytes):
     cf = [f"https://speed.cloudflare.com/__down?bytes={nbytes}"]
     mirrors = [
         "https://speed.hetzner.de/1GB.bin",
-        "http://proof.ovh.net/files/1Gio.dat",
-        "http://mirror.nl.leaseweb.net/speedtest/1000mb.bin",
-        "http://mirror.dal10.us.leaseweb.net/speedtest/1000mb.bin",
-        "http://mirror.de.leaseweb.net/speedtest/1000mb.bin",
-        "http://lg-sin.fdcservers.net/1GBtest.zip",
-        "http://lg-tok.fdcservers.net/1GBtest.zip",
-        "http://lg-lax.fdcservers.net/1GBtest.zip",
         "https://speedtest.tele2.net/1GB.zip",
+        "https://proof.ovh.net/files/1Gio.dat",
+        "https://lon.speedtest.clouvider.net/1g.bin",
+        "https://nyc.speedtest.clouvider.net/1g.bin",
+        "https://la.speedtest.clouvider.net/1g.bin",
     ]
     random.shuffle(mirrors)   # 备用源随机排序，多机不撞同一个
     return cf + mirrors
