@@ -1,44 +1,52 @@
 #!/bin/bash
-# OCI Instance Activity Service - 一键安装
-# 用法：
-# curl -fsSL https://raw.githubusercontent.com/zhangchedan000/keepalive/main/install.sh | bash
-
 set -euo pipefail
-
 RAW_BASE="https://raw.githubusercontent.com/zhangchedan000/keepalive/main"
 SVC="keepalive"
 PY="/root/keepalive.py"
 UNIT="/etc/systemd/system/${SVC}.service"
+CONFIG_DIR="/etc/keepalive"
+STATE_DIR="/var/lib/keepalive"
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "请使用 root 运行。"
-    exit 1
+  echo "请使用 root 运行。"
+  exit 1
 fi
 
-echo "[*] 检查依赖..."
-if ! command -v python3 >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y python3
-fi
-if ! command -v curl >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y curl
+if ! command -v python3 >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y python3 curl
 fi
 
-echo "[*] 下载脚本..."
-curl -fsSL "${RAW_BASE}/keepalive.py" -o "${PY}"
-chmod 755 "${PY}"
+mkdir -p "$CONFIG_DIR" "$STATE_DIR/cache"
+curl -fsSL "${RAW_BASE}/keepalive.py" -o "$PY"
+curl -fsSL "${RAW_BASE}/keepalive.service" -o "$UNIT"
+chmod 755 "$PY"
 
-echo "[*] 安装 systemd 服务..."
-curl -fsSL "${RAW_BASE}/keepalive.service" -o "${UNIT}"
-mkdir -p /var/lib/oci-activity
+if [ ! -f "$CONFIG_DIR/config.json" ]; then
+cat > "$CONFIG_DIR/config.json" <<'JSON'
+{
+  "cycle_days": 7,
+  "cpu_start_pct": 20.0,
+  "cpu_target_min_pct": 22.0,
+  "cpu_target_max_pct": 27.0,
+  "memory_start_pct": 20.0,
+  "memory_target_min_pct": 22.0,
+  "memory_target_max_pct": 26.0,
+  "normal_network_min_gb": 1.0,
+  "normal_network_max_gb": 5.0,
+  "high_network_min_gb": 10.0,
+  "high_network_max_gb": 50.0,
+  "write_downloads_to_disk": false
+}
+JSON
+fi
 
 systemctl daemon-reload
-systemctl enable --now "${SVC}"
+systemctl enable "$SVC" >/dev/null
+systemctl restart "$SVC"
 
-echo
-echo "[OK] 安装完成"
-echo "状态：systemctl status ${SVC} --no-pager"
-echo "日志：journalctl -u ${SVC} -f"
-echo "进程：pgrep -af keepalive.py"
-echo "卸载：curl -fsSL ${RAW_BASE}/uninstall.sh | bash"
+echo "[OK] 安装或更新完成"
+echo "状态：python3 /root/keepalive.py --status"
+echo "服务：systemctl status keepalive --no-pager"
+echo "日志：journalctl -u keepalive -f"
+echo "卸载：curl -fsSL ${RAW_BASE}/uninstall.sh | sudo bash"
