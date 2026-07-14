@@ -1,251 +1,269 @@
 #!/usr/bin/env python3
 """
-System Metrics Collector
-拟真综合负载：日夜作息 CPU 波动 + 常驻内存渐进起伏 + 定期大流量下载(网络保活) + 零星磁盘 IO。
-进程名伪装为 python3-worker，三项指标(CPU/内存/网络)均达标，含多机随机化。
+OCI instance activity service.
+
+Compared with the previous fixed-ratio stress loop, this version uses:
+- per-host deterministic profiles;
+- long low-load periods plus short compute jobs;
+- gradual cache-sized memory changes;
+- low-frequency disk verification;
+- lightweight health checks and occasional bounded downloads.
+
+It does not rename or hide the process. Resource use remains bounded by systemd.
 """
-import os, time, random, gzip, hashlib, urllib.request, tempfile, multiprocessing, datetime
 
-# ===== 可调参数（想改占用改这里）=====
-# 白天时段（服务器本地时间，24小时制）
-DAY_START = 8
-DAY_END = 24
+from __future__ import annotations
 
-# 白天 CPU 占用区间（每核）
-CPU_DAY_MIN = 0.30
-CPU_DAY_MAX = 0.42
-# 夜间 CPU 占用区间（每核）—— 压在甲骨文回收线(20%)上方，安全不浪费
-CPU_NIGHT_MIN = 0.20
-CPU_NIGHT_MAX = 0.25
+import gzip
+import hashlib
+import json
+import math
+import multiprocessing
+import os
+import random
+import socket
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
 
-# 内存占用区间（总内存百分比）
-MEM_MIN_PCT = 0.30
-MEM_MAX_PCT = 0.45
+HOST = socket.gethostname()
+SEED = int(hashlib.sha256(HOST.encode()).hexdigest()[:16], 16)
+PROFILE = random.Random(SEED)
 
-# CPU 偶发尖峰
-SPIKE_CHANCE = 0.05
-SPIKE_MIN = 0.55
-SPIKE_MAX = 0.72
+DAY_START = PROFILE.randint(7, 10)
+DAY_END = PROFILE.randint(21, 24)
 
-# 网络：定期大文件下载（只下不存）
-NET_DL_MB_MIN = 80
-NET_DL_MB_MAX = 200
-NET_GAP_DAY_MIN = 45 * 60
-NET_GAP_DAY_MAX = 90 * 60
-NET_GAP_NIGHT_MIN = 90 * 60
-NET_GAP_NIGHT_MAX = 180 * 60
-NET_MAX_SECONDS = 300        # 单次下载最长时间
-NET_MIN_SPEED = 50 * 1024    # 最低可接受速率(50KB/s)，低于此判为龟速，换源
+# Each host receives a different long-term range.
+CPU_IDLE_MIN = PROFILE.uniform(0.02, 0.06)
+CPU_IDLE_MAX = PROFILE.uniform(0.07, 0.13)
+CPU_ACTIVE_MIN = PROFILE.uniform(0.16, 0.24)
+CPU_ACTIVE_MAX = PROFILE.uniform(0.28, 0.42)
+CPU_BURST_MAX = PROFILE.uniform(0.45, 0.62)
 
-# 多机随机化：启动时随机延迟，避免多台机器行为完全同步
-STARTUP_JITTER_MAX = 120     # 启动随机延迟 0~120 秒
-# =====================================
+# Memory is a cache-like allocation, not a fixed percentage target.
+MEM_MIN_PCT = PROFILE.uniform(0.08, 0.14)
+MEM_MAX_PCT = PROFILE.uniform(0.18, 0.30)
+MEM_STEP_MB = PROFILE.randint(16, 48)
 
-# 小流量请求目标
-SMALL_URLS = [
+HEALTH_URLS = [
     "https://www.cloudflare.com/cdn-cgi/trace",
-    "https://api.github.com",
-    "https://www.bing.com",
-    "https://www.debian.org",
-    "https://www.wikipedia.org",
+    "https://api.github.com/rate_limit",
+    "https://www.debian.org/",
 ]
 
+DOWNLOAD_SIZES = [8, 16, 24, 32]  # MiB, bounded and infrequent
+STATE_DIR = Path("/var/lib/oci-activity")
 
-def disguise(name=b"python3-worker"):
+
+def total_mem_bytes() -> int:
     try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").prctl(15, name, 0, 0, 0)
-    except Exception:
-        pass
-
-
-def total_mem_bytes():
-    try:
-        with open("/proc/meminfo") as f:
+        with open("/proc/meminfo", encoding="utf-8") as f:
             for line in f:
                 if line.startswith("MemTotal:"):
                     return int(line.split()[1]) * 1024
-    except Exception:
+    except OSError:
         pass
-    return 2 * 1024 ** 3
+    return 1024**3
 
 
-def is_daytime():
-    h = datetime.datetime.now().hour
-    return DAY_START <= h < DAY_END
+def is_daytime() -> bool:
+    hour = time.localtime().tm_hour
+    return DAY_START <= hour < DAY_END
 
 
-def pick_cpu_target():
-    if random.random() < SPIKE_CHANCE:
-        return random.uniform(SPIKE_MIN, SPIKE_MAX)
+def cpu_target(worker_id: int, now: float) -> float:
+    # Slow independent waves avoid identical behavior between cores and hosts.
+    period = 1200 + ((SEED + worker_id * 137) % 2400)
+    phase = ((SEED >> 7) + worker_id * 193) % period
+    wave = (math.sin((now + phase) * 2 * math.pi / period) + 1) / 2
+
     if is_daytime():
-        return random.uniform(CPU_DAY_MIN, CPU_DAY_MAX)
-    return random.uniform(CPU_NIGHT_MIN, CPU_NIGHT_MAX)
+        low, high = CPU_IDLE_MIN, CPU_ACTIVE_MAX
+    else:
+        low, high = CPU_IDLE_MIN * 0.55, CPU_ACTIVE_MIN * 0.70
+
+    target = low + (high - low) * (wave**2)
+    return max(0.01, min(target, CPU_BURST_MAX))
 
 
-def big_url(nbytes):
-    """下载源：Cloudflare(可指定字节数)优先，后接多个公开测速站备用，顺序打乱增加随机性"""
-    cf = [f"https://speed.cloudflare.com/__down?bytes={nbytes}"]
-    mirrors = [
-        "https://speed.hetzner.de/1GB.bin",
-        "https://speedtest.tele2.net/1GB.zip",
-        "https://proof.ovh.net/files/1Gio.dat",
-        "https://lon.speedtest.clouvider.net/1g.bin",
-        "https://nyc.speedtest.clouvider.net/1g.bin",
-        "https://la.speedtest.clouvider.net/1g.bin",
-    ]
-    random.shuffle(mirrors)   # 备用源随机排序，多机不撞同一个
-    return cf + mirrors
+def cpu_worker(worker_id: int) -> None:
+    rng = random.Random(SEED + worker_id * 1009 + os.getpid())
+    payload = os.urandom(rng.randint(96, 320) * 1024)
+    window = 0.5
+    target = CPU_IDLE_MIN
+    next_update = 0.0
+    burst_until = 0.0
 
-
-def cpu_worker():
-    disguise()
-    data = os.urandom(200_000)
-    target = pick_cpu_target()
-    next_drift = time.time() + random.uniform(30, 90)
-    window = 0.2
     while True:
-        if time.time() > next_drift:
-            target = pick_cpu_target()
-            if target >= SPIKE_MIN:
-                next_drift = time.time() + random.uniform(8, 25)
-            else:
-                next_drift = time.time() + random.uniform(30, 90)
+        now = time.time()
+        if now >= next_update:
+            target = cpu_target(worker_id, now)
+            # Realistic short compute job, only occasionally.
+            if rng.random() < 0.025:
+                target = rng.uniform(CPU_ACTIVE_MIN, CPU_BURST_MAX)
+                burst_until = now + rng.uniform(8, 35)
+            elif burst_until and now >= burst_until:
+                burst_until = 0.0
+            next_update = now + rng.uniform(25, 110)
+
         busy = window * target
-        b_end = time.time() + busy
-        while time.time() < b_end:
-            c = gzip.compress(data, 6)
-            hashlib.sha256(c).hexdigest()
-        idle = window - busy
-        if idle > 0:
-            time.sleep(idle)
+        end = time.perf_counter() + busy
+        while time.perf_counter() < end:
+            compressed = gzip.compress(payload, compresslevel=rng.choice((1, 3, 6)))
+            hashlib.sha256(compressed).digest()
+
+        time.sleep(max(0.0, window - busy))
 
 
-def mem_worker():
-    """内存常驻：分块渐进申请（不一次猛占），到点释放再重来"""
-    disguise()
+def memory_worker() -> None:
+    rng = random.Random(SEED + 500_003 + os.getpid())
     total = total_mem_bytes()
-    CHUNK = 128 * 1024 * 1024   # 每块 128MB，渐进增长
+    blocks: list[bytearray] = []
+    allocated = 0
+    current_pct = rng.uniform(MEM_MIN_PCT, MEM_MAX_PCT)
+
     while True:
-        target_bytes = int(total * random.uniform(MEM_MIN_PCT, MEM_MAX_PCT))
-        blocks = []
-        allocated = 0
-        # 分块申请，边申请边真实写入，避免瞬时冲击
-        try:
-            while allocated < target_bytes:
-                size = min(CHUNK, target_bytes - allocated)
-                blk = bytearray(size)
-                for i in range(0, size, 4096):
-                    blk[i] = 1
-                blocks.append(blk)
-                allocated += size
-                time.sleep(0.05)   # 每块之间小停顿，平滑增长
-        except MemoryError:
-            pass   # 申请到多少算多少，不崩
-        # 保持占用一段时间，期间轻触防换出
-        end = time.time() + random.uniform(90, 240)
-        while time.time() < end and blocks:
-            blk = random.choice(blocks)
-            blk[random.randint(0, len(blk) - 1)] = random.randint(0, 255)
-            time.sleep(random.uniform(2, 6))
-        # 先彻底释放再进入下一轮，避免与自身重启叠加
-        blocks.clear()
-        del blocks
-        time.sleep(random.uniform(2, 5))
-
-
-def download_once(nbytes):
-    """下载指定字节数，只读不存；限时+龟速检测，慢就换源"""
-    deadline = time.time() + NET_MAX_SECONDS
-    for url in big_url(nbytes):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                got = 0
-                last_check = time.time()
-                last_bytes = 0
-                while time.time() < deadline:
-                    chunk = r.read(1024 * 256)
-                    if not chunk:
-                        break
-                    got += len(chunk)
-                    if got >= nbytes:
-                        return True
-                    # 每 5 秒检测一次速率，龟速就放弃换下一个源
-                    now = time.time()
-                    if now - last_check >= 5:
-                        speed = (got - last_bytes) / (now - last_check)
-                        if speed < NET_MIN_SPEED:
-                            break   # 太慢，跳出去换源
-                        last_check = now
-                        last_bytes = got
-            if got >= nbytes:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def net_worker():
-    disguise()
-    while True:
-        mb = random.randint(NET_DL_MB_MIN, NET_DL_MB_MAX)
-        download_once(mb * 1024 * 1024)
-        if is_daytime():
-            gap = random.uniform(NET_GAP_DAY_MIN, NET_GAP_DAY_MAX)
+        # Slow drift resembles application cache growth and eviction.
+        current_pct += rng.uniform(-0.008, 0.008)
+        current_pct = max(MEM_MIN_PCT, min(current_pct, MEM_MAX_PCT))
+        if not is_daytime():
+            effective_pct = current_pct * rng.uniform(0.72, 0.92)
         else:
-            gap = random.uniform(NET_GAP_NIGHT_MIN, NET_GAP_NIGHT_MAX)
-        end = time.time() + gap
-        while time.time() < end:
-            try:
-                req = urllib.request.Request(
-                    random.choice(SMALL_URLS), headers={"User-Agent": "Mozilla/5.0"}
-                )
-                urllib.request.urlopen(req, timeout=10).read(random.randint(2048, 65536))
-            except Exception:
-                pass
-            time.sleep(random.uniform(20, 60))
+            effective_pct = current_pct
 
+        target = int(total * effective_pct)
+        step = rng.randint(max(8, MEM_STEP_MB // 2), MEM_STEP_MB) * 1024 * 1024
 
-def disk_worker():
-    disguise()
-    while True:
         try:
-            with tempfile.NamedTemporaryFile(delete=False, dir="/tmp") as f:
-                path = f.name
-                f.write(os.urandom(random.randint(1, 20) * 1024 * 1024))
-            with open(path, "rb") as rf:
-                while rf.read(1024 * 1024):
-                    pass
-            os.remove(path)
+            if allocated + step < target:
+                block = bytearray(step)
+                for i in range(0, len(block), 4096):
+                    block[i] = (i // 4096) % 251
+                blocks.append(block)
+                allocated += len(block)
+            elif allocated - step > target and blocks:
+                block = blocks.pop(0)
+                allocated -= len(block)
+            elif blocks:
+                block = rng.choice(blocks)
+                block[rng.randrange(0, len(block), 4096)] ^= 1
+        except MemoryError:
+            if blocks:
+                allocated -= len(blocks.pop(0))
+
+        time.sleep(rng.uniform(25, 75))
+
+
+def request_small(url: str, limit: int = 64 * 1024) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": "OCI-Activity/2.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            response.read(limit)
+    except Exception:
+        return
+
+
+def bounded_download(size_mib: int) -> None:
+    size = size_mib * 1024 * 1024
+    url = f"https://speed.cloudflare.com/__down?bytes={size}"
+    req = urllib.request.Request(url, headers={"User-Agent": "OCI-Activity/2.0"})
+    remaining = size
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            while remaining > 0:
+                chunk = response.read(min(256 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                time.sleep(0.03)
+    except Exception:
+        return
+
+
+def network_worker() -> None:
+    rng = random.Random(SEED + 700_001 + os.getpid())
+    next_download = time.time() + rng.uniform(4 * 3600, 9 * 3600)
+
+    while True:
+        request_small(rng.choice(HEALTH_URLS), rng.randint(8, 64) * 1024)
+        if time.time() >= next_download:
+            bounded_download(rng.choice(DOWNLOAD_SIZES))
+            next_download = time.time() + rng.uniform(5 * 3600, 12 * 3600)
+
+        delay = rng.uniform(4 * 60, 15 * 60)
+        if not is_daytime():
+            delay *= rng.uniform(1.3, 2.0)
+        time.sleep(delay)
+
+
+def disk_worker() -> None:
+    rng = random.Random(SEED + 900_001 + os.getpid())
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    while True:
+        time.sleep(rng.uniform(45 * 60, 150 * 60))
+        path: Path | None = None
+        try:
+            size = rng.randint(4, 24) * 1024 * 1024
+            with tempfile.NamedTemporaryFile(
+                dir=STATE_DIR, prefix="verify-", suffix=".bin", delete=False
+            ) as f:
+                path = Path(f.name)
+                digest = hashlib.sha256()
+                remaining = size
+                while remaining:
+                    chunk = os.urandom(min(1024 * 1024, remaining))
+                    f.write(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+
+            read_digest = hashlib.sha256()
+            with path.open("rb") as f:
+                while chunk := f.read(1024 * 1024):
+                    read_digest.update(chunk)
+
+            status = {
+                "time": int(time.time()),
+                "size": size,
+                "ok": digest.hexdigest() == read_digest.hexdigest(),
+            }
+            (STATE_DIR / "last-verify.json").write_text(
+                json.dumps(status), encoding="utf-8"
+            )
         except Exception:
             pass
-        time.sleep(random.uniform(15, 50))
+        finally:
+            if path:
+                path.unlink(missing_ok=True)
 
 
-def main():
-    disguise()
-    # 多机随机化：启动随机延迟，错开多台机器的节奏
-    time.sleep(random.uniform(0, STARTUP_JITTER_MAX))
-    random.seed()
+def start_process(target, *args) -> multiprocessing.Process:
+    process = multiprocessing.Process(target=target, args=args, daemon=False)
+    process.start()
+    return process
 
+
+def main() -> None:
+    # Stable per-host startup offset plus small runtime jitter.
+    time.sleep((SEED % 90) + random.uniform(0, 30))
     cores = os.cpu_count() or 1
-    specs = [cpu_worker] * cores + [mem_worker, net_worker, disk_worker]
-    procs = []
-    for fn in specs:
-        p = multiprocessing.Process(target=fn, daemon=True)
-        p.start()
-        procs.append(p)
-        time.sleep(0.2)   # 子进程错峰启动
 
-    # 守护：进程崩了独立重启（每个进程内存互相隔离，不会叠加占用）
+    # Use fewer CPU workers on larger machines; each worker remains independently bounded.
+    cpu_workers = max(1, min(cores, 4))
+    specs: list[tuple] = [(cpu_worker, (i,)) for i in range(cpu_workers)]
+    specs.extend([(memory_worker, ()), (network_worker, ()), (disk_worker, ())])
+
+    processes = [start_process(fn, *args) for fn, args in specs]
+
     while True:
-        time.sleep(10)
-        for i, p in enumerate(procs):
-            if not p.is_alive():
-                np = multiprocessing.Process(target=specs[i], daemon=True)
-                np.start()
-                procs[i] = np
+        time.sleep(20)
+        for i, process in enumerate(processes):
+            if not process.is_alive():
+                fn, args = specs[i]
+                processes[i] = start_process(fn, *args)
 
 
 if __name__ == "__main__":
