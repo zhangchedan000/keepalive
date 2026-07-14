@@ -1,5 +1,5 @@
 [Unit]
-Description=OCI Instance Activity Service
+Description=Adaptive Resource Workload Controller
 After=network-online.target
 Wants=network-online.target
 
@@ -7,18 +7,19 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/bin/python3 /root/keepalive.py
 Restart=always
-RestartSec=20
-
+RestartSec=15
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
-CPUQuota=180%
-MemoryMax=8G
-
+CPUQuota=360%
+MemoryMax=35%
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/keepalive /etc/keepalive
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target
