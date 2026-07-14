@@ -1,16 +1,24 @@
 [Unit]
-Description=System Metrics Collector
+Description=OCI Instance Activity Service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash -c 'exec -a python3-worker /usr/bin/python3 /root/keepalive.py'
+ExecStart=/usr/bin/python3 /root/keepalive.py
 Restart=always
-RestartSec=15
-CPUQuota=400%
-MemoryMax=14G
+RestartSec=20
+
 Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUQuota=180%
+MemoryMax=8G
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
 
 [Install]
 WantedBy=multi-user.target
