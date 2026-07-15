@@ -32,10 +32,10 @@ cat > "$CONFIG_DIR/config.json" <<'JSON'
   "memory_start_pct": 20.0,
   "memory_target_min_pct": 22.0,
   "memory_target_max_pct": 26.0,
-  "normal_network_min_gb": 1.0,
-  "normal_network_max_gb": 5.0,
-  "high_network_min_gb": 10.0,
-  "high_network_max_gb": 50.0,
+  "normal_network_min_gb": 0.5,
+  "normal_network_max_gb": 3.0,
+  "high_network_min_gb": 5.0,
+  "high_network_max_gb": 15.0,
   "write_downloads_to_disk": false
 }
 JSON
