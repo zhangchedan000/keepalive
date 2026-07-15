@@ -18,7 +18,7 @@ PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/keepalive /etc/keepalive
+ReadWritePaths=/var/lib/keepalive /etc/keepalive /var/log/keepalive
 TimeoutStopSec=20
 
 [Install]
